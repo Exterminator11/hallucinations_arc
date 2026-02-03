@@ -121,10 +121,6 @@ def clean_file():
     os.replace(temp_file, input_file)
 
 
-# if __name__ == "__main__":
-#     create_dataset()
+if __name__ == "__main__":
+    create_dataset()
 
-if __name__=="__main__":
-    # repeat_facts(25000,0.05)
-    # mix_file()
-    clean_file()
