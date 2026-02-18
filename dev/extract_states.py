@@ -12,7 +12,7 @@ truthful_qa_dataset = load_dataset(
 ).take(100)
 
 # 2. Configuration
-MODEL_NAME = "nvidia/OpenReasoning-Nemotron-1.5B"
+MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
 DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
 
 # 3. Load Model

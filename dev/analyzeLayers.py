@@ -3,8 +3,10 @@ import numpy as np
 from sklearn.decomposition import PCA
 import matplotlib.pyplot as plt
 import re
+from sklearn.preprocessing import StandardScaler
 
-MODEL_NAME = "nvidia/OpenReasoning-Nemotron-1.5B"
+
+MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
 file = f"{re.sub('/', ' ', MODEL_NAME)}_hallucination_states.pkl"
 df = pd.read_pickle(file)
 
@@ -35,13 +37,20 @@ def analyzeLayers():
     for i in range(n_layers):
         try:
             # Flatten each state for this layer
+            # Flatten each state for this layer
             tt_flattened = np.array([state.flatten() for state in truths[i]])
             ff_flattened = np.array([state.flatten() for state in hallucinations[i]])
-            
-            # Apply PCA
+
+            # ---- Standardize (fit on truth only) ----
+            scaler = StandardScaler()
+            tt_scaled = scaler.fit_transform(tt_flattened)
+            ff_scaled = scaler.transform(ff_flattened)
+
+            # ---- Apply PCA (fit on truth only) ----
             pca = PCA(n_components=2)
-            tt_2d = pca.fit_transform(tt_flattened)
-            ff_2d = pca.transform(ff_flattened)
+            tt_2d = pca.fit_transform(tt_scaled)
+            ff_2d = pca.transform(ff_scaled)
+
             
             # Plot on the i-th subplot
             axes[i].scatter(tt_2d[:, 0], tt_2d[:, 1], color="blue", label="Truth", alpha=0.6, s=20)
