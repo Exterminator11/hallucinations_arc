@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
+import re
 
 # 1. Load Dataset
 truthful_qa_dataset = load_dataset(
@@ -11,10 +12,7 @@ truthful_qa_dataset = load_dataset(
 ).take(100)
 
 # 2. Configuration
-MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
-# Qwen 1.5B has 28 layers (0-27).
-# We probe Layer 14 (Middle) and Layer 28 (Final).
-TARGET_LAYERS = [14, 28]
+MODEL_NAME = "nvidia/OpenReasoning-Nemotron-1.5B"
 DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
 
 # 3. Load Model
@@ -22,6 +20,8 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_NAME, torch_dtype=torch.float16, device_map=DEVICE
 )
+
+TARGET_LAYERS = [i for i in range(model.config.num_hidden_layers+1)]
 
 
 def get_research_data(question):
@@ -111,5 +111,5 @@ for i, data in enumerate(truthful_qa_dataset):
 
 # Save
 df = pd.DataFrame(dataset_results)
-df.to_pickle("qwen_hallucination_states.pkl")
-print("Done! Saved to qwen_hallucination_states.pkl")
+df.to_pickle(f"{re.sub("/"," ",MODEL_NAME)}_hallucination_states.pkl")
+print(f"Done! Saved to {re.sub("/"," ",MODEL_NAME)}_hallucination_states.pkl")
