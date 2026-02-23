@@ -111,5 +111,5 @@ for i, data in enumerate(truthful_qa_dataset):
 
 # Save
 df = pd.DataFrame(dataset_results)
-df.to_pickle(f"{re.sub("/"," ",MODEL_NAME)}_hallucination_states.pkl")
-print(f"Done! Saved to {re.sub("/"," ",MODEL_NAME)}_hallucination_states.pkl")
+df.to_pickle(f"{re.sub("/"," ",MODEL_NAME)}_without_labels.pkl")
+print(f"Done! Saved to {re.sub("/"," ",MODEL_NAME)}_without_labels.pkl")

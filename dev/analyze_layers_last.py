@@ -3,29 +3,15 @@ import numpy as np
 from sklearn.decomposition import PCA
 import matplotlib.pyplot as plt
 import re
-from sklearn.preprocessing import StandardScaler, MaxAbsScaler, RobustScaler
+from sklearn.preprocessing import StandardScaler
 
 MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
-file = f"{re.sub('/', ' ', MODEL_NAME)}_prompt_hallucination_states.pkl"
+file = f"{re.sub('/', ' ', MODEL_NAME)}_hallucination_states_last.pkl"
 df = pd.read_pickle(file)
-
-
-def pad_and_flatten(states):
-    """Flatten each state and pad to the max length with zeros."""
-    flattened = [s.flatten() for s in states]
-    max_len = max(f.shape[0] for f in flattened)
-    padded = np.array(
-        [
-            np.pad(f, (0, max_len - f.shape[0]), mode="constant", constant_values=0)
-            for f in flattened
-        ]
-    )
-    return padded
 
 
 def analyzeLayers():
     state_columns = df.columns[df.columns.str.startswith("state_")]
-    labels = df["hallucination_label"].values
 
     truths = []
     hallucinations = []
@@ -45,41 +31,14 @@ def analyzeLayers():
 
     for i in range(n_layers):
         try:
-            # Pad all states in this layer to the same length before flattening
-            all_states = np.concatenate([truths[i], hallucinations[i]])
-            all_flattened = [s.flatten() for s in all_states]
-            max_len = max(
-                f.shape[0] for f in all_flattened
-            )  # global max for this layer
+            # Each state is already (hidden_dim,) — just stack directly
+            tt_flattened = np.stack(truths[i])  # (n_truth, hidden_dim)
+            ff_flattened = np.stack(hallucinations[i])  # (n_hallucination, hidden_dim)
 
-            tt_flattened = np.array(
-                [
-                    np.pad(
-                        s.flatten(),
-                        (0, max_len - s.flatten().shape[0]),
-                        mode="constant",
-                        constant_values=0,
-                    )
-                    for s in truths[i]
-                ]
-            )
-            ff_flattened = np.array(
-                [
-                    np.pad(
-                        s.flatten(),
-                        (0, max_len - s.flatten().shape[0]),
-                        mode="constant",
-                        constant_values=0,
-                    )
-                    for s in hallucinations[i]
-                ]
-            )
+            scaler = StandardScaler()
+            tt_scaled = scaler.fit_transform(tt_flattened)
+            ff_scaled = scaler.transform(ff_flattened)
 
-            scalar = StandardScaler()
-            tt_scaled = scalar.fit_transform(tt_flattened)
-            ff_scaled = scalar.transform(ff_flattened)
-
-            # PCA (fit on truth only)
             pca = PCA(n_components=2)
             tt_2d = pca.fit_transform(tt_scaled)
             ff_2d = pca.transform(ff_scaled)
@@ -116,12 +75,12 @@ def analyzeLayers():
 
     plt.tight_layout()
     plt.savefig(
-        f"{re.sub('/', ' ', MODEL_NAME)}_prompt_hallucination_states_layer_analysis.png",
+        f"{re.sub('/', ' ', MODEL_NAME)}hallucination_states_layer_analysis_last.png",
         dpi=150,
         bbox_inches="tight",
     )
     print(
-        f"Saved plot to {re.sub('/', ' ', MODEL_NAME)}_prompt_hallucination_states_layer_analysis.png"
+        f"Saved plot to {re.sub('/', ' ', MODEL_NAME)}hallucination_states_layer_analysis_last.png"
     )
 
 

@@ -33,14 +33,15 @@ def get_prompt_states(question):
     ).to(DEVICE)
 
     with torch.no_grad():
-        # Forward pass for prompt hidden states
         outputs = model(**inputs, output_hidden_states=True)
 
     prompt_layers = {}
     for layer_idx in TARGET_LAYERS:
-        # Shape: (seq_len, hidden_dim) — all prompt tokens for this layer
-        all_tokens = outputs.hidden_states[layer_idx].squeeze(0).float().cpu().numpy()
-        prompt_layers[f"layer_{layer_idx}"] = all_tokens
+        # Grab only the last token: shape (hidden_dim,)
+        last_token = (
+            outputs.hidden_states[layer_idx].squeeze(0)[-1].float().cpu().numpy()
+        )
+        prompt_layers[f"layer_{layer_idx}"] = last_token
 
     del outputs, inputs
     gc.collect()
@@ -79,12 +80,10 @@ dataset_results = []
 for i, data in enumerate(truthful_qa_dataset):
     q = data["Question"]
     ref = data["Best Answer"]
+
     prompt = f"Question: {q}\nAnswer:"
 
-    # Get model's generated answer
     model_answer = get_model_answer(prompt)
-
-    # Get prompt hidden states (all layers, all tokens)
     prompt_states = get_prompt_states(prompt)
 
     result_row = {
@@ -93,7 +92,7 @@ for i, data in enumerate(truthful_qa_dataset):
         "model_output": model_answer,
     }
 
-    # Each value is shape (seq_len, hidden_dim)
+    # Each value is now shape (hidden_dim,) — last token only
     for layer_idx in TARGET_LAYERS:
         key = f"layer_{layer_idx}"
         result_row[f"state_{key}"] = prompt_states[key]
@@ -105,6 +104,6 @@ for i, data in enumerate(truthful_qa_dataset):
 
 # Save
 df = pd.DataFrame(dataset_results)
-save_name = f"{re.sub('/', '_', MODEL_NAME)}_prompt_without_labels.pkl"
+save_name = f"{re.sub('/', '_', MODEL_NAME)}_prompt_without_labels_last.pkl"
 df.to_pickle(save_name)
 print(f"Done! Saved to {save_name}")
