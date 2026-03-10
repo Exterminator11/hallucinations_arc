@@ -24,17 +24,32 @@ model = AutoModelForCausalLM.from_pretrained(
 TARGET_LAYERS = [i for i in range(model.config.num_hidden_layers+1)]
 
 
+def format_prompt(question):  # ← ADDED
+    messages = [
+        {
+            "role": "system",
+            "content": "Answer the following question concisely and accurately.",
+        },
+        {"role": "user", "content": question},
+    ]
+    return tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+
+
 def get_research_data(question):
     inputs = tokenizer(question, return_tensors="pt").to(DEVICE)
 
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
-            max_new_tokens=50,
+            max_new_tokens=200,
             return_dict_in_generate=True,
             output_hidden_states=True,
             eos_token_id=tokenizer.eos_token_id,
             pad_token_id=tokenizer.eos_token_id,
+            do_sample=True,  # ← must be True to use temperature
+            temperature=0.1,
         )
 
     # Extract Answer Text
@@ -86,7 +101,7 @@ for i, data in enumerate(truthful_qa_dataset):
     ref = data["Best Answer"]
 
     # Simple prompt
-    prompt = f"Question: {q}\nAnswer:"
+    prompt = format_prompt(q)
 
     gen_ans, states = get_research_data(prompt)
 

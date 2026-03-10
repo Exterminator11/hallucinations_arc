@@ -210,3 +210,5 @@ __marimo__/
 *.pkl
 /nanogpt
 .txt
+*.json
+*.pt

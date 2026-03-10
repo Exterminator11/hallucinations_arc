@@ -3,7 +3,7 @@ import pandas as pd
 import re
 
 MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
-file = f"/Users/rachitdas/Desktop/hallucinations_arc/dev/{re.sub("/"," ",MODEL_NAME)}_without_labels_last.pkl"
+file = f"/Users/rachitdas/Desktop/hallucinations_arc/dev/{re.sub("/"," ",MODEL_NAME)}_without_labels.pkl"
 
 
 def return_prompt(MODEL_OUTPUT, CORRECT_OUTPUT):
@@ -63,6 +63,7 @@ def evaluate_responses():
             print(f"Evaluated {i+1}/{len(df)} responses")
 
     df['hallucination_label']=results
+    print(df)
     df.to_pickle(f"{re.sub("/"," ",MODEL_NAME)}_hallucination_states_last.pkl")
 
 if __name__ == "__main__":
