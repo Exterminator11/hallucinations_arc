@@ -5,8 +5,8 @@ import matplotlib.pyplot as plt
 import re
 from sklearn.preprocessing import StandardScaler, MaxAbsScaler, RobustScaler
 
-MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
-file = f"{re.sub('/', ' ', MODEL_NAME)}_prompt_hallucination_states.pkl"
+MODEL_NAME = "unsloth/Meta-Llama-3.1-8B-Instruct"
+file = f"/Users/rachitdas/Desktop/hallucinations_arc/dev/unsloth Meta-Llama-3.1-8B-Instruct_hallucination_states_last.pkl"
 df = pd.read_pickle(file)
 
 

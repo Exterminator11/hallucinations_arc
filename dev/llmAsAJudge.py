@@ -2,8 +2,8 @@ from ollama import Client
 import pandas as pd
 import re
 
-MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
-file = f"/Users/rachitdas/Desktop/hallucinations_arc/dev/{re.sub("/"," ",MODEL_NAME)}_without_labels.pkl"
+MODEL_NAME = "unsloth/Meta-Llama-3.1-8B-Instruct"
+file = f"/Users/rachitdas/Desktop/hallucinations_arc/dev/mistralai Mistral-7B-Instruct-v0.2_without_labels.pkl"
 
 
 def return_prompt(MODEL_OUTPUT, CORRECT_OUTPUT):
