@@ -12,8 +12,9 @@ truthful_qa_dataset = load_dataset(
 ).take(100)
 
 # 2. Configuration
-MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
-DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
+MODEL_NAME = "Qwen/Qwen3-1.7B"
+# DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # 3. Load Model
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
