@@ -125,3 +125,10 @@ toward the correct answer. If it does, Head 7 is causally upstream of the failur
 | `hook_resid_post` norm + LDA per layer | Where residual stream representations diverge |
 | `hook_mlp_out` norm at answer positions | Whether MLP outputs are the upstream cause |
 | Same analysis on Head 5 | Whether the finding generalizes to other late-layer heads |
+
+
+
+The cross-model generalizable findings(Qwen3 1.7B and 4B)
+Despite different head indices and scales, two patterns survive across both models:
+1. Late-layer value norm reversal — hallucinated tokens have higher value norms than truthful ones in the final layers. Both models show this. This is the overcompensation signal — the model writes louder when uncertain but incoherently.
+2. At least one head writes stronger keys on truthful tokens in the penultimate layer — head 7 in 1.7B, partially visible in 4B. This may be a functionally consistent "confidence head" that activates on grounded content.

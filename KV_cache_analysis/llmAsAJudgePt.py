@@ -2,8 +2,8 @@ from ollama import Client
 import torch
 import re
 
-MODEL_NAME = "meta-llama_Llama-3.1-8B-Instruct"
-file = "/Users/rachitdas/Desktop/hallucinations_arc/KV_cache_analysis/meta-llama_Llama-3.1-8B-Instruct_all_layers_with_attn.pt"  # updated file
+MODEL_NAME = "qwen3-4b"
+file = "/Users/rachitdas/Desktop/hallucinations_arc/KV_cache_analysis/qwen3-4b_all_layers_with_attn.pt"  # updated file
 
 
 def return_prompt(MODEL_OUTPUT, CORRECT_OUTPUT):
