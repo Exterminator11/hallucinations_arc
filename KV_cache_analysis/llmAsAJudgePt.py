@@ -2,8 +2,8 @@ from ollama import Client
 import torch
 import re
 
-MODEL_NAME = "qwen3-4b"
-file = "/Users/rachitdas/Desktop/hallucinations_arc/KV_cache_analysis/qwen3-4b_all_layers_with_attn.pt"  # updated file
+MODEL_NAME = "qwen2.5-1.5b-instruct"
+file = "/Users/rachitdas/Desktop/hallucinations_arc/KV_cache_analysis/qwen2.5-1.5b-instruct_hallucination_labels_KV.pt"  # updated file
 
 
 def return_prompt(MODEL_OUTPUT, CORRECT_OUTPUT):

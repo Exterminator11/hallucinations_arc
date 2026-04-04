@@ -1,63 +1,162 @@
-import pandas as pd
+"""
+Generic KV-cache hallucination analysis.
+Works with any TransformerLens model — GQA or MHA, any depth, any head count.
+
+Usage:
+    python analysis_generic.py \
+        --file  path/to/records.pt \
+        --model my-model-name \
+        --outdir ./results
+"""
+
+import argparse
+import os
+import numpy as np
 import torch
 import matplotlib.pyplot as plt
-import numpy as np
-
-FILE_PATH = "/Users/rachitdas/Desktop/hallucinations_arc/KV_cache_analysis/qwen3-4b_hallucination_labels_KV.pt"
-MODEL = "qwen3-4b"  # for context in plots, if needed
-
-def load_data():
-    print(f"Loading data from {FILE_PATH}...")
-    data = torch.load(FILE_PATH)
-    return pd.DataFrame(data)
-
-"""
-Experiment 1 - Key Norm trajectory
-Compute mean key norm at answer positions only, averaged across heads, per layer, comparing hallucinated vs. truthful populations.
-
-1. If both populations start similarly and diverge at a specific layer → that layer is where the failure begins
-2. If hallucinated key norms are lower from layer 0 → inherited from embeddings, attention isn't the cause
-3. If they're similar throughout → key space doesn't reflect the hidden state collapse you observed, look elsewhere
-"""
+import pandas as pd
 
 
-"""
-Experiment 2 - Value Norm Trajectory
-Compute mean value norm at answer positions only, averaged across heads, per layer, comparing hallucinated vs. truthful populations.
+# ── CLI ────────────────────────────────────────────────────────────────────────
 
-1. If value norms track key norms closely → keys and values are collapsing together, both are reflecting the same upstream failure
-2. If value norms diverge where key norms didn't → values carry additional signal that keys missed, the failure is in what gets written not what gets attended to
-3. If value norms are similar across populations even where key norms diverged → the model is attending weakly but still writing meaningful content, attention routing is the problem not the information itself
-"""
-def key_value_norm_trajectory(df):
-    mask = df["metadata"].apply(lambda m: m["hallucination_label"])
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--file", required=True, help="Path to labelled .pt records file")
+    p.add_argument(
+        "--model", required=True, help="Model name (used for output filenames)"
+    )
+    p.add_argument("--outdir", default=".", help="Directory to save plots")
+    p.add_argument(
+        "--label-key",
+        default="hallucination_label",
+        help="Key inside metadata dict that holds 0/1 hallucination label",
+    )
+    return p.parse_args()
+
+
+# ── Data loading ───────────────────────────────────────────────────────────────
+
+
+def load_data(file_path, label_key):
+    print(f"Loading {file_path} ...")
+    records = torch.load(file_path, weights_only=False)
+    df = pd.DataFrame(records)
+
+    # Drop records where the judge failed to produce a label
+    before = len(df)
+    df = df[df["metadata"].apply(lambda m: m.get(label_key, -1) != -1)].reset_index(
+        drop=True
+    )
+    print(f"  {before} records loaded, {len(df)} usable after dropping parse failures.")
+
+    labels = df["metadata"].apply(lambda m: m[label_key])
+    print(f"  Hallucinated : {(labels == 1).sum()}")
+    print(f"  Truthful     : {(labels == 0).sum()}")
+    return df, label_key
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+
+def split_populations(df, label_key):
+    mask = df["metadata"].apply(lambda m: m[label_key])
+    return df[mask == 0], df[mask == 1]
+
+
+def sorted_layers(df):
+    return sorted(df.iloc[0]["layers"].keys())
+
+
+def savefig(fig, outdir, model, suffix):
+    safe_model = model.replace("/", "_").replace(" ", "_")
+    path = os.path.join(outdir, f"{safe_model}_{suffix}.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved → {path}")
+
+
+def expand_kv_to_q_heads(v, n_q_heads):
+    """
+    Expand KV heads to match query heads for GQA models.
+    v shape: [n_kv_heads, seq_len, head_dim]
+    Returns: [n_q_heads, seq_len, head_dim]
+    """
+    n_kv_heads = v.shape[0]
+    if n_kv_heads == n_q_heads:
+        return v
+    group_size = n_q_heads // n_kv_heads
+    return v.repeat_interleave(group_size, dim=0)
+
+
+def get_n_q_heads(df):
+    """Derive number of query heads from pattern tensor shape."""
+    sample_layer = sorted_layers(df)[0]
+    pattern = df.iloc[0]["layers"][sample_layer]["pattern"]
+    # pattern shape: [1, n_q_heads, seq_len_dst, seq_len_src]
+    return pattern.shape[1]
+
+
+def get_n_kv_heads(df):
+    """Derive number of KV heads from value tensor shape."""
+    sample_layer = sorted_layers(df)[0]
+    v = df.iloc[0]["layers"][sample_layer]["v"]
+    # v shape: [1, seq_len, n_kv_heads, head_dim]
+    return v.shape[2]
+
+
+def late_layer_cutoff(all_layers, fraction=0.7):
+    """Return layers in the last (1 - fraction) of the network."""
+    idx = int(len(all_layers) * fraction)
+    return all_layers[idx:]
+
+
+# ── Experiment 2 & 3: Key / Value norm trajectory ─────────────────────────────
+
+
+def key_value_norm_trajectory(df, label_key, outdir, model):
+    """
+    Experiment 2 & 3 — Key & Value Norm Trajectory.
+
+    Compute mean key and value norm at answer positions only (tokens after
+    question_len), averaged across heads, per layer, comparing hallucinated
+    vs. truthful populations.
+
+    Interpretation:
+        1. Both populations diverge at a specific layer → that layer is where
+           the failure begins.
+        2. Hallucinated norms are lower from layer 0 → collapse is inherited
+           from embeddings; attention is not the cause.
+        3. Similar throughout → key/value space does not reflect the hidden
+           state collapse; look elsewhere (entropy, cancellation).
+        4. Value norms track key norms closely → both collapse together,
+           pointing to the same upstream failure.
+        5. Value norms diverge where key norms did not → failure is in what
+           gets written into the residual, not in what gets attended to.
+    """
+    print("\n[Exp 2/3] Key & Value norm trajectory ...")
+    truth_df, halluc_df = split_populations(df, label_key)
+    layers = sorted_layers(df)
 
     results = {}
-    for label, subset_df in [("truth", df[mask == 0]), ("hallucinated", df[mask == 1])]:
+    for label, subset in [("truth", truth_df), ("hallucinated", halluc_df)]:
         layer_norms = {"k": {}, "v": {}}
-
-        for _, row in subset_df.iterrows():
+        for _, row in subset.iterrows():
             q_len = row["metadata"]["question_len"]
-
-            for layer, tensors in row["layers"].items():
+            for layer in layers:
+                tensors = row["layers"][layer]
                 for kv_key in ("k", "v"):
-                    kv = tensors[kv_key][
-                        0, q_len:, :, :
-                    ]  # [answer_len, num_heads, head_dim]
-                    mean_norm = kv.norm(dim=-1).mean().item()
-                    layer_norms[kv_key].setdefault(layer, []).append(mean_norm)
+                    # shape: [1, seq_len, n_heads, head_dim]
+                    kv = tensors[kv_key][0, q_len:, :, :]  # [ans_len, n_heads, d_head]
+                    norm = kv.norm(dim=-1).mean().item()  # mean over positions & heads
+                    layer_norms[kv_key].setdefault(layer, []).append(norm)
 
         results[label] = {
-            kv_key: {
-                layer: torch.tensor(vals).mean().item() for layer, vals in norms.items()
-            }
-            for kv_key, norms in layer_norms.items()
+            kv: {l: float(np.mean(v)) for l, v in norms.items()}
+            for kv, norms in layer_norms.items()
         }
 
-    # ── Plot ──────────────────────────────────────────────────────────────────
-    layers = sorted(results["truth"]["k"].keys())
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-
     for ax, kv_key, title in [
         (ax1, "k", "Key Norm Trajectory"),
         (ax2, "v", "Value Norm Trajectory"),
@@ -75,60 +174,64 @@ def key_value_norm_trajectory(df):
         ax.set_ylabel("Mean Norm")
         ax.legend()
         ax.grid(alpha=0.3)
-
-    plt.savefig(f"{MODEL}_kv_norm_trajectory.png", dpi=150)
-
+    fig.suptitle(f"{model} — Key & Value Norm Trajectory", fontsize=13)
+    savefig(fig, outdir, model, "kv_norm_trajectory")
     return results
 
 
-"""
-Experiment 3 - Attention Entropy at Answer Positions
-Compute per-head entropy of the attention pattern at answer destination positions, averaged across heads, per layer, comparing hallucinated vs. truthful populations.
-What entropy means here:
+# ── Experiment 4: Attention entropy ───────────────────────────────────────────
 
-1. High entropy → attention is spread flat across all source positions, the head isn't confidently routing to anything specific
-2. Low entropy → attention is sharp, the head has a clear source it's pulling from
-3. Uniform attention over many value vectors averages them toward zero — this is the direct link between high entropy and the collapse you observed
-"""
-def attention_entropy(df):
+
+def attention_entropy(df, label_key, outdir, model):
     """
-    pattern shape: [1, num_heads, seq_len_dst, seq_len_src]
-    We want answer positions as *destination* rows → pattern[0, :, q_len:, :]
-    Entropy per head per dst position: -sum(p * log(p + eps))
-    Then mean over dst positions and heads → scalar per layer per sample
+    Experiment 4 — Attention Entropy at Answer Positions.
+
+    Compute per-head Shannon entropy of the attention pattern at answer
+    destination positions (post-softmax rows), averaged across heads and
+    answer tokens, per layer.
+
+    pattern shape : [1, n_q_heads, seq_dst, seq_src]
+    Slice         : pattern[0, :, q_len:, :] → answer rows only
+    Entropy       : -sum(p * log(p + eps)) over the source dimension
+
+    Interpretation:
+        1. High entropy → attention is spread flat across all source positions;
+           the head is not confidently routing to anything specific.
+        2. Low entropy → attention is sharp; the head has a clear source.
+        3. Uniform attention over many value vectors averages them toward zero —
+           this is the direct mechanistic link between high entropy and the
+           hidden state collapse observed in earlier experiments.
+        4. Hallucinated positions have consistently higher entropy → diffuse
+           attention is a primary signal of uncertainty.
+        5. Entropy similar across populations → diffusion is not the mechanism;
+           fall back to norm collapse as the primary explanation.
+
+    A reference ceiling of log(seq_len) (maximum possible entropy) is plotted
+    as a dashed line for calibration.
     """
-    mask = df["metadata"].apply(lambda m: m["hallucination_label"])
+    print("\n[Exp 4] Attention entropy ...")
+    truth_df, halluc_df = split_populations(df, label_key)
+    layers = sorted_layers(df)
     eps = 1e-9
 
     results = {}
-    for label, subset_df in [("truth", df[mask == 0]), ("hallucinated", df[mask == 1])]:
-        layer_entropies = {}
-
-        for _, row in subset_df.iterrows():
+    for label, subset in [("truth", truth_df), ("hallucinated", halluc_df)]:
+        layer_ent = {}
+        for _, row in subset.iterrows():
             q_len = row["metadata"]["question_len"]
+            for layer in layers:
+                # pattern: [1, n_q_heads, seq_dst, seq_src]
+                p = row["layers"][layer]["pattern"][0, :, q_len:, :]
+                ent = -(p * (p + eps).log()).sum(dim=-1).mean().item()
+                layer_ent.setdefault(layer, []).append(ent)
+        results[label] = {l: float(np.mean(v)) for l, v in layer_ent.items()}
 
-            for layer, tensors in row["layers"].items():
-                pattern = tensors["pattern"][
-                    0, :, q_len:, :
-                ]  # [num_heads, answer_len, seq_len_src]
+    # Reference ceiling: log(seq_len)
+    sample_p = df.iloc[0]["layers"][layers[0]]["pattern"]
+    seq_len = sample_p.shape[-1]
+    max_ent = float(torch.log(torch.tensor(seq_len, dtype=torch.float)))
 
-                # Entropy per head per answer position
-                entropy = -(pattern * (pattern + eps).log()).sum(
-                    dim=-1
-                )  # [num_heads, answer_len]
-                mean_entropy = entropy.mean().item()  # scalar
-
-                layer_entropies.setdefault(layer, []).append(mean_entropy)
-
-        results[label] = {
-            layer: torch.tensor(vals).mean().item()
-            for layer, vals in layer_entropies.items()
-        }
-
-    # ── Plot ──────────────────────────────────────────────────────────────────
-    layers = sorted(results["truth"].keys())
     fig, ax = plt.subplots(figsize=(10, 5))
-
     for label, color in [("truth", "steelblue"), ("hallucinated", "tomato")]:
         ax.plot(
             layers,
@@ -137,83 +240,88 @@ def attention_entropy(df):
             marker="o",
             color=color,
         )
-
-    # Annotate max entropy (log(seq_len)) as a reference ceiling
-    sample_pattern = df.iloc[0]["layers"][layers[0]]["pattern"]
-    seq_len = sample_pattern.shape[-1]
     ax.axhline(
-        torch.log(torch.tensor(seq_len, dtype=torch.float)).item(),
+        max_ent,
         linestyle="--",
         color="gray",
         alpha=0.5,
         label=f"Max entropy (log {seq_len})",
     )
-
-    ax.set_title("Attention Entropy at Answer Positions")
+    ax.set_title(f"{model} — Attention Entropy at Answer Positions")
     ax.set_xlabel("Layer")
     ax.set_ylabel("Mean Entropy (nats)")
     ax.legend()
     ax.grid(alpha=0.3)
-
-    plt.savefig(f"{MODEL}_attention_entropy.png", dpi=150)
-
+    savefig(fig, outdir, model, "attention_entropy")
     return results
 
-"""
-Experiment 4 - Value Cancellation Ratio
-Compute the weighted value output per head (pattern @ values), compare the norm of the sum across heads against the sum of norms, per layer, at answer positions only.What the ratio means:
-1. Ratio near 1 → all heads writing in the same direction, constructive interference, strong residual update
-2. Ratio near 0 → heads writing in opposing directions, cancelling each other out, net residual update collapses to near zero despite each head individually being active
-3. This is a fundamentally different failure mode from Experiments 2-4 — the individual heads can have healthy key and value norms and sharp attention, but still produce a collapsed residual if they cancel
-"""
 
-def value_cancellation_ratio(df):
-    """
-    pattern shape : [1, num_heads, seq_len_dst, seq_len_src]
-    v shape       : [1, seq_len_src, num_heads, head_dim]
+# ── Experiment 6: Value cancellation ratio ────────────────────────────────────
 
-    For each answer position:
-        weighted_v per head = pattern[head, dst, :] @ v[:, head, :]  → [head_dim]
-        sum_of_norms        = sum over heads of ||weighted_v_h||
-        norm_of_sum         = ||sum over heads of weighted_v_h||
-        ratio               = norm_of_sum / (sum_of_norms + eps)
-    Then average ratio over answer positions → scalar per layer per sample
+
+def value_cancellation_ratio(df, label_key, outdir, model):
     """
-    mask = df["metadata"].apply(lambda m: m["hallucination_label"])
+    Experiment 6 — Value Cancellation Ratio at Answer Positions.
+
+    Compute the weighted value output per head (pattern @ values), then
+    compare the norm of the sum across heads against the sum of individual
+    head norms, per layer, at answer positions only.
+
+    Tensor shapes:
+        pattern : [1, n_q_heads, seq_dst, seq_src]
+        v       : [1, seq_src, n_kv_heads, head_dim]
+
+    For GQA models, KV heads are expanded to match query heads via
+    repeat_interleave before the einsum.
+
+    Ratio = ||sum_h(weighted_v_h)|| / (sum_h(||weighted_v_h||) + eps)
+
+    Interpretation:
+        1. Ratio near 1 → all heads write in the same direction (constructive
+           interference); the residual stream receives a strong, coherent update.
+        2. Ratio near 0 → heads write in opposing directions and cancel each
+           other out; the net residual update collapses to near zero even though
+           each head is individually active.
+        3. This is a fundamentally different failure mode from norm collapse —
+           individual heads can have healthy key/value norms and sharp attention
+           but still produce a collapsed residual if they destructively interfere.
+        4. Low ratio on hallucinated positions → destructive interference is an
+           active mechanism driving the hidden state collapse.
+        5. Similar ratio across populations → cancellation is not the primary
+           cause; norm collapse and entropy are more likely explanations.
+    """
+    print("\n[Exp 6] Value cancellation ratio ...")
+    truth_df, halluc_df = split_populations(df, label_key)
+    layers = sorted_layers(df)
+    n_q_heads = get_n_q_heads(df)
     eps = 1e-9
 
     results = {}
-    for label, subset_df in [("truth", df[mask == 0]), ("hallucinated", df[mask == 1])]:
+    for label, subset in [("truth", truth_df), ("hallucinated", halluc_df)]:
         layer_ratios = {}
-
-        for _, row in subset_df.iterrows():
+        for _, row in subset.iterrows():
             q_len = row["metadata"]["question_len"]
+            for layer in layers:
+                tensors = row["layers"][layer]
 
-            for layer, tensors in row["layers"].items():
-                pattern = tensors["pattern"][0, :, q_len:, :]       # [16, answer_len, seq_len_src]
-                v = tensors["v"][0].permute(1, 0, 2)                # [8, seq_len_src, head_dim]
+                # pattern: [1, n_q_heads, seq_dst, seq_src]
+                pattern = tensors["pattern"][0, :, q_len:, :]  # [n_q, ans, src]
 
-                n_q_heads, n_kv_heads = pattern.shape[0], v.shape[0]
-                group_size = n_q_heads // n_kv_heads
-                v_expanded = v.repeat_interleave(group_size, dim=0)  # [16, seq_len_src, head_dim]
+                # v: [1, seq_src, n_kv_heads, head_dim] → [n_kv, src, d]
+                v = tensors["v"][0].permute(1, 0, 2)
+                v = expand_kv_to_q_heads(v, n_q_heads)  # [n_q, src, d]
 
-                weighted_v = torch.einsum("hts,hsd->htd", pattern, v_expanded)  # [16, answer_len, head_dim]
+                # weighted value per head: [n_q, ans, d]
+                wv = torch.einsum("hts,hsd->htd", pattern, v)
 
-                norm_of_sum = weighted_v.sum(dim=0).norm(dim=-1)  # [answer_len]
-                sum_of_norms = weighted_v.norm(dim=-1).sum(dim=0)  # [answer_len]
-
+                norm_of_sum = wv.sum(dim=0).norm(dim=-1)  # [ans]
+                sum_of_norms = wv.norm(dim=-1).sum(dim=0)  # [ans]
                 ratio = (norm_of_sum / (sum_of_norms + eps)).mean().item()
+
                 layer_ratios.setdefault(layer, []).append(ratio)
+        results[label] = {l: float(np.mean(v)) for l, v in layer_ratios.items()}
 
-        results[label] = {
-            layer: torch.tensor(vals).mean().item()
-            for layer, vals in layer_ratios.items()
-        }
-
-    # ── Plot ──────────────────────────────────────────────────────────────────
-    layers = sorted(results["truth"].keys())
     fig, ax = plt.subplots(figsize=(10, 5))
-
     for label, color in [("truth", "steelblue"), ("hallucinated", "tomato")]:
         ax.plot(
             layers,
@@ -222,203 +330,228 @@ def value_cancellation_ratio(df):
             marker="o",
             color=color,
         )
-
     ax.axhline(
-        1.0,
-        linestyle="--",
-        color="green",
-        alpha=0.4,
-        label="Ratio = 1 (fully constructive)",
+        1.0, linestyle="--", color="green", alpha=0.4, label="Ratio=1 (constructive)"
     )
     ax.axhline(
-        0.0,
-        linestyle="--",
-        color="red",
-        alpha=0.4,
-        label="Ratio = 0 (full cancellation)",
+        0.0, linestyle="--", color="red", alpha=0.4, label="Ratio=0 (full cancel)"
     )
-    ax.set_title("Value Cancellation Ratio at Answer Positions")
+    ax.set_title(f"{model} — Value Cancellation Ratio at Answer Positions")
     ax.set_xlabel("Layer")
     ax.set_ylabel("Cancellation Ratio")
     ax.set_ylim(-0.05, 1.05)
     ax.legend()
     ax.grid(alpha=0.3)
-
-    plt.savefig(f"{MODEL}_value_cancellation_ratio.png", dpi=150)
-
+    savefig(fig, outdir, model, "value_cancellation_ratio")
     return results
 
-"""
-Experiment 5: Per-Head Consistency AnalysisFor each head separately, compute mean key norm and value norm at answer positions across layers, comparing hallucinated vs. truthful populations.What you're looking for:
-1. Whether the collapse is diffuse - all heads equally weak on hallucinated inputs, suggesting a global representational failure
-2. Whether the collapse is sparse — a small subset of heads consistently weaker on hallucinated inputs, suggesting a specific circuit is implicated
-3. Whether implicated heads are consistent across layers or shift as depth increases
-"""
-def per_head_consistency(df):
-    """
-    For each (layer, head): mean key norm and value norm at answer positions,
-    averaged across samples — separately for truth and hallucinated populations.
-    Output: heatmaps of shape [num_layers, num_heads] for k and v, both populations.
-    """
-    mask = df["metadata"].apply(lambda m: m["hallucination_label"])
 
-    results = {}
-    for label, subset_df in [("truth", df[mask == 0]), ("hallucinated", df[mask == 1])]:
-        # {layer: {head: [per-sample mean norms]}}
-        layer_head_k = {}
-        layer_head_v = {}
+# ── Experiment 7: Per-head consistency ────────────────────────────────────────
 
-        for _, row in subset_df.iterrows():
+
+def per_head_consistency(df, label_key, outdir, model):
+    """
+    Experiment 7 — Per-Head Consistency Analysis.
+
+    For each (layer, head) pair, compute the mean key norm and value norm at
+    answer positions, averaged across samples, separately for hallucinated and
+    truthful populations. Outputs 2D matrices of shape [n_layers, n_heads].
+
+    For GQA models, value tensors are expanded to match the number of query
+    heads before computing per-head norms.
+
+    Plots:
+        - Heatmap of truth key/value norms      [n_layers × n_heads]
+        - Heatmap of hallucinated key/value norms
+        - Difference heatmap (truth − halluc):
+            Blue  → truth has higher norm (head writes more on truthful tokens)
+            Red   → halluc has higher norm (head writes more on hallucinated tokens)
+
+    Interpretation:
+        1. Uniform color across all heads → global representational failure;
+           no specific circuit is implicated.
+        2. Specific rows (heads) consistently highlighted → those heads are
+           implicated across layers; a sparse circuit may be responsible.
+        3. Specific columns (layers) highlighted → failure is concentrated at
+           that depth; look at what circuit activates there.
+        4. Scattered bright spots → noisy signal; head-level analysis is
+           uninformative for this model.
+        5. Red in late layers (halluc > truth) → overcompensation: the model
+           writes louder but more incoherently on uncertain tokens.
+
+    Note: head indices are model-specific and do not transfer across models.
+    Use the functional characterisation of implicated heads (attention pattern
+    structure, what token types they attend to) for cross-model comparison.
+
+    Returns a dict with truth/halluc matrices and difference matrices for
+    downstream use (e.g. automatic selection of most discriminative head).
+    """
+    print("\n[Exp 7] Per-head consistency ...")
+    truth_df, halluc_df = split_populations(df, label_key)
+    layers = sorted_layers(df)
+    n_q_heads = get_n_q_heads(df)
+
+    def compute_matrices(subset):
+        # Derive actual k/v head counts from tensors — independent of n_q_heads
+        # k: [1, seq, n_k_heads, d]  — may differ from n_q_heads in GQA models
+        # v: [1, seq, n_v_heads, d]  — same as n_k_heads for all standard models
+        sample = subset.iloc[0]["layers"][layers[0]]
+        n_k_heads = sample["k"].shape[2]
+        n_v_heads = sample["v"].shape[2]
+
+        layer_head_k = {l: {h: [] for h in range(n_k_heads)} for l in layers}
+        layer_head_v = {l: {h: [] for h in range(n_v_heads)} for l in layers}
+
+        for _, row in subset.iterrows():
             q_len = row["metadata"]["question_len"]
+            for layer in layers:
+                tensors = row["layers"][layer]
+                k = tensors["k"][0, q_len:, :, :]  # [ans, n_k_heads, d]
+                v = tensors["v"][0, q_len:, :, :]  # [ans, n_v_heads, d]
 
-            for layer, tensors in row["layers"].items():
-                k = tensors["k"][0, q_len:, :, :]  # [answer_len, num_heads, head_dim]
-                v = tensors["v"][0, q_len:, :, :]  # [answer_len, num_heads, head_dim]
+                k_norms = k.norm(dim=-1).mean(dim=0)  # [n_k_heads]
+                v_norms = v.norm(dim=-1).mean(dim=0)  # [n_v_heads]
 
-                # norm over head_dim, mean over answer positions → [num_heads]
-                k_norms = k.norm(dim=-1).mean(dim=0)  # [num_heads]
-                v_norms = v.norm(dim=-1).mean(dim=0)  # [num_heads]
+                for h in range(n_k_heads):
+                    layer_head_k[layer][h].append(k_norms[h].item())
+                for h in range(n_v_heads):
+                    layer_head_v[layer][h].append(v_norms[h].item())
 
-                for head in range(k_norms.shape[0]):
-                    layer_head_k.setdefault(layer, {}).setdefault(head, []).append(
-                        k_norms[head].item()
-                    )
-                    layer_head_v.setdefault(layer, {}).setdefault(head, []).append(
-                        v_norms[head].item()
-                    )
+        k_mat = np.array(
+            [[np.mean(layer_head_k[l][h]) for h in range(n_k_heads)] for l in layers]
+        )  # [n_layers, n_k_heads]
+        v_mat = np.array(
+            [[np.mean(layer_head_v[l][h]) for h in range(n_v_heads)] for l in layers]
+        )  # [n_layers, n_v_heads]
+        return k_mat, v_mat
 
-        # Average across samples → 2D arrays [num_layers, num_heads]
-        layers = sorted(layer_head_k.keys())
-        n_heads = max(max(d.keys()) for d in layer_head_k.values()) + 1
+    truth_k, truth_v = compute_matrices(truth_df)
+    halluc_k, halluc_v = compute_matrices(halluc_df)
 
-        k_matrix = np.array(
-            [[np.mean(layer_head_k[l][h]) for h in range(n_heads)] for l in layers]
-        )
-        v_matrix = np.array(
-            [[np.mean(layer_head_v[l][h]) for h in range(n_heads)] for l in layers]
-        )
-
-        results[label] = {"k": k_matrix, "v": v_matrix}
-
-    # ── Plot: 4 heatmaps (truth/halluc × k/v) + difference heatmaps ──────────
     fig, axes = plt.subplots(3, 2, figsize=(16, 14))
-    layers_list = sorted(layer_head_k.keys())
+    layer_labels = [str(l) for l in layers]
 
-    for col, kv_key, title in [(0, "k", "Key Norm"), (1, "v", "Value Norm")]:
-        truth_mat = results["truth"][kv_key]
-        halluc_mat = results["hallucinated"][kv_key]
-        diff_mat = truth_mat - halluc_mat  # positive → truth has higher norm
+    for col, (t_mat, h_mat, title) in enumerate(
+        [
+            (truth_k, halluc_k, "Key Norm"),
+            (truth_v, halluc_v, "Value Norm"),
+        ]
+    ):
+        diff = t_mat - h_mat
+        vmax = max(t_mat.max(), h_mat.max())
+        dlim = np.abs(diff).max()
+        n_heads_this = t_mat.shape[1]  # use actual head count per matrix
 
-        vmax = max(truth_mat.max(), halluc_mat.max())
-
-        im0 = axes[0, col].imshow(
-            truth_mat.T,
-            aspect="auto",
-            origin="lower",
-            vmin=0,
-            vmax=vmax,
-            cmap="viridis",
-        )
-        im1 = axes[1, col].imshow(
-            halluc_mat.T,
-            aspect="auto",
-            origin="lower",
-            vmin=0,
-            vmax=vmax,
-            cmap="viridis",
-        )
-        im2 = axes[2, col].imshow(
-            diff_mat.T,
-            aspect="auto",
-            origin="lower",
-            cmap="RdBu",
-            vmin=-abs(diff_mat).max(),
-            vmax=abs(diff_mat).max(),
-        )
-
-        for ax, label in zip(
-            [axes[0, col], axes[1, col], axes[2, col]],
-            [f"Truth {title}", f"Hallucinated {title}", f"Difference (Truth − Halluc)"],
+        for row_idx, (mat, label, cmap, vmin_, vmax_) in enumerate(
+            [
+                (t_mat, f"Truth {title}", "viridis", 0, vmax),
+                (h_mat, f"Hallucinated {title}", "viridis", 0, vmax),
+                (diff, "Difference (Truth−Halluc)", "RdBu", -dlim, dlim),
+            ]
         ):
+            ax = axes[row_idx, col]
+            im = ax.imshow(
+                mat.T, aspect="auto", origin="lower", cmap=cmap, vmin=vmin_, vmax=vmax_
+            )
             ax.set_title(label)
             ax.set_xlabel("Layer")
             ax.set_ylabel("Head")
-            ax.set_xticks(range(len(layers_list)))
-            ax.set_xticklabels(layers_list, fontsize=7)
+            ax.set_xticks(range(len(layers)))
+            ax.set_xticklabels(layer_labels, fontsize=6, rotation=45)
+            ax.set_yticks(range(n_heads_this))
+            plt.colorbar(im, ax=ax)
 
-        plt.colorbar(im0, ax=axes[0, col])
-        plt.colorbar(im1, ax=axes[1, col])
-        plt.colorbar(im2, ax=axes[2, col])
+    fig.suptitle(
+        f"{model} — Per-Head Consistency: Key & Value Norms", fontsize=13, y=1.01
+    )
+    savefig(fig, outdir, model, "per_head_consistency")
 
-    plt.suptitle("Per-Head Consistency: Key & Value Norms", fontsize=14, y=1.01)
-    
-    plt.savefig(f"{MODEL}_per_head_consistency.png", dpi=150, bbox_inches="tight")
-    
+    # Return matrices for downstream use (e.g. picking best head)
+    return {
+        "truth": {"k": truth_k, "v": truth_v},
+        "hallucinated": {"k": halluc_k, "v": halluc_v},
+        "diff_k": truth_k - halluc_k,
+        "diff_v": truth_v - halluc_v,
+        "layers": layers,
+    }
 
-    return results
 
-"""
-Experiment 6 - Question Token vs. Answer Token NormsRepeat the key and value norm analysis from Experiments 2 and 3 but on question tokens instead of answer tokens, using question_len as the upper boundary instead of the lower one.What you're looking for:
-1. If question token norms are similar across hallucinated and truthful populations → the model encoded the question fine, the failure is purely in generation
-2. If question token norms are already lower on hallucinated records → the failure begins during question encoding, pointing back to the embedding hypothesis from our earlier discussion
-3. If question norms diverge at a specific layer → that layer is where the model begins to "lose" the question representation on inputs it will later hallucinate on
-"""
-def question_answer_token_analysis(df):
+def best_discriminative_head(consistency_results, n_late=5):
+    """Return the head index most discriminative in the last n_late layers."""
+    diff_k = consistency_results["diff_k"]  # [n_layers, n_heads]
+    late = diff_k[-n_late:]
+    return int(np.argmax(np.abs(late).mean(axis=0)))
+
+
+# ── Experiment 8: Question vs answer token norms ──────────────────────────────
+
+
+def question_answer_token_analysis(df, label_key, outdir, model):
     """
-    Repeat key/value norm trajectory from Exp 1&2 but separately for:
-      - question tokens : [:q_len]
-      - answer tokens   : [q_len:]
-    Plots side by side so divergence timing is directly comparable.
+    Experiment 8 — Question Token vs. Answer Token Norms.
+
+    Repeat the key and value norm trajectory from Experiments 2 & 3 but
+    separately for:
+        - Question tokens : k/v[0, :q_len, :, :]
+        - Answer tokens   : k/v[0, q_len:, :, :]
+
+    Plots all four combinations (key/value × question/answer) side by side so
+    divergence timing is directly comparable across regions.
+
+    Interpretation:
+        1. Question norms similar, answer norms lower on hallucinated →
+           the model encoded the question correctly but failed during
+           generation; failure is in the decoding/answering circuit.
+        2. Question norms already lower on hallucinated records →
+           failure begins during question encoding; points back to the
+           embedding hypothesis (low-norm embeddings for uncertain inputs).
+        3. Question norms lower on hallucinated, answer norms similar →
+           question encoded weakly but generation partially recovers;
+           some downstream circuit compensates.
+        4. Both similar across populations →
+           neither region shows norm collapse in k/v space; investigate
+           attention entropy and cancellation ratio as primary mechanisms.
+
+    The cleanest finding for hallucination research is case 1: it isolates
+    the failure to the generation phase and rules out question misrepresentation
+    as a confound.
     """
-    mask = df["metadata"].apply(lambda m: m["hallucination_label"])
-    eps = 1e-9
+    print("\n[Exp 8] Question vs answer token norms ...")
+    truth_df, halluc_df = split_populations(df, label_key)
+    layers = sorted_layers(df)
 
     results = {}
-    for label, subset_df in [("truth", df[mask == 0]), ("hallucinated", df[mask == 1])]:
-        layer_norms = {
-            "q_k": {},
-            "q_v": {},  # question region
-            "a_k": {},
-            "a_v": {},  # answer region
-        }
-
-        for _, row in subset_df.iterrows():
+    for label, subset in [("truth", truth_df), ("hallucinated", halluc_df)]:
+        region_norms = {"q_k": {}, "q_v": {}, "a_k": {}, "a_v": {}}
+        for _, row in subset.iterrows():
             q_len = row["metadata"]["question_len"]
-
-            for layer, tensors in row["layers"].items():
-                k = tensors["k"][0]  # [seq_len, num_heads, head_dim]
-                v = tensors["v"][0]  # [seq_len, num_heads, head_dim]
-
-                for region_key, region_slice in [
+            for layer in layers:
+                k = row["layers"][layer]["k"][0]  # [seq, n_heads, d]
+                v = row["layers"][layer]["v"][0]  # [seq, n_kv, d]
+                for prefix, slc in [
                     ("q", slice(None, q_len)),
                     ("a", slice(q_len, None)),
                 ]:
-                    k_region = k[region_slice]  # [region_len, num_heads, head_dim]
-                    v_region = v[region_slice]
-
-                    k_norm = k_region.norm(dim=-1).mean().item()
-                    v_norm = v_region.norm(dim=-1).mean().item()
-
-                    layer_norms[f"{region_key}_k"].setdefault(layer, []).append(k_norm)
-                    layer_norms[f"{region_key}_v"].setdefault(layer, []).append(v_norm)
-
+                    k_r = k[slc]
+                    v_r = v[slc]
+                    region_norms[f"{prefix}_k"].setdefault(layer, []).append(
+                        k_r.norm(dim=-1).mean().item()
+                    )
+                    region_norms[f"{prefix}_v"].setdefault(layer, []).append(
+                        v_r.norm(dim=-1).mean().item()
+                    )
         results[label] = {
-            key: {layer: np.mean(vals) for layer, vals in norms.items()}
-            for key, norms in layer_norms.items()
+            key: {l: float(np.mean(vs)) for l, vs in norms.items()}
+            for key, norms in region_norms.items()
         }
 
-    # ── Plot ──────────────────────────────────────────────────────────────────
-    layers = sorted(results["truth"]["q_k"].keys())
     fig, axes = plt.subplots(2, 2, figsize=(16, 10))
-
-    plot_cfg = [
+    for ax, key, title in [
         (axes[0, 0], "q_k", "Key Norm — Question Tokens"),
         (axes[0, 1], "a_k", "Key Norm — Answer Tokens"),
         (axes[1, 0], "q_v", "Value Norm — Question Tokens"),
         (axes[1, 1], "a_v", "Value Norm — Answer Tokens"),
-    ]
-
-    for ax, key, title in plot_cfg:
+    ]:
         for label, color in [("truth", "steelblue"), ("hallucinated", "tomato")]:
             ax.plot(
                 layers,
@@ -432,122 +565,131 @@ def question_answer_token_analysis(df):
         ax.set_ylabel("Mean Norm")
         ax.legend()
         ax.grid(alpha=0.3)
-
-    plt.suptitle("Question vs. Answer Token Norms by Population", fontsize=14)
-
-    plt.savefig(f"{MODEL}_question_answer_token_norms.png", dpi=150)
-
+    fig.suptitle(f"{model} — Question vs Answer Token Norms", fontsize=13)
+    savefig(fig, outdir, model, "question_answer_token_norms")
     return results
 
 
-def head7_attention_visualization(df, head_idx=7, n_examples=3, late_layers_only=True):
-    mask = df["metadata"].apply(lambda m: m["hallucination_label"])
-    truth_df = df[mask == 0].head(n_examples)
-    halluc_df = df[mask == 1].head(n_examples)
+# ── Discriminative head attention visualisation ────────────────────────────────
 
-    all_layers = sorted(df.iloc[0]["layers"].keys())
-    # Focus on late layers where divergence was observed in Exp 5
-    layers = [l for l in all_layers if l >= 20] if late_layers_only else all_layers
-    n_layers = len(layers)
 
-    def plot_population(subset_df, label):
-        examples = list(subset_df.iterrows())
+def head_attention_visualization(df, label_key, head_idx, outdir, model, n_examples=3):
+    """
+    Discriminative Head Attention Visualisation.
+
+    For the most discriminative head identified in Experiment 7, plot the
+    attention pattern at answer destination positions across the late layers
+    of the network (last 30% of depth by default), for n_examples from each
+    population.
+
+    Tensor slice:
+        pattern[0, head_idx, q_len:, :] → [answer_len, seq_src]
+
+    The attention sink at position 0 is zeroed before plotting so that
+    non-sink attention is visible. A white vertical line marks the Q|A
+    boundary. Each cell is annotated with the fraction of non-sink attention
+    directed at question tokens (←Q score).
+
+    head_idx is automatically clamped to [0, n_heads-1] so the function is
+    safe to call even if the derived head index exceeds the model's head count.
+
+    Saves two figures:
+        {model}_head{head_idx}_attn_truth.png
+        {model}_head{head_idx}_attn_hallucinated.png
+    """
+    print(f"\n[Head viz] Head {head_idx} attention patterns ...")
+    truth_df, halluc_df = split_populations(df, label_key)
+    all_layers = sorted_layers(df)
+    late_layers = late_layer_cutoff(all_layers, fraction=0.7)
+
+    def plot_population(subset, pop_label):
+        examples = list(subset.head(n_examples).iterrows())
         n_cols = len(examples)
+        n_rows = len(late_layers)
 
         fig, axes = plt.subplots(
-            n_layers,
-            n_cols,
-            figsize=(n_cols * 7, n_layers * 1.8),  # more height per row
-            sharex="col",
-            sharey=False,  # independent y per cell — answer lengths may differ
+            n_rows, n_cols, figsize=(n_cols * 7, n_rows * 2), sharex="col"
         )
-        if n_layers == 1:
+        if n_rows == 1:
             axes = axes[np.newaxis, :]
         if n_cols == 1:
             axes = axes[:, np.newaxis]
 
-        color = "steelblue" if label == "Truth" else "tomato"
+        color = "steelblue" if pop_label == "Truth" else "tomato"
         fig.suptitle(
-            f"Head {head_idx} Attention Pattern — {label} (Layers {layers[0]}–{layers[-1]})",
-            fontsize=13,
+            f"Head {head_idx} Attention — {pop_label} "
+            f"(Layers {late_layers[0]}–{late_layers[-1]})",
+            fontsize=12,
             fontweight="bold",
-            y=1.01,
             color=color,
+            y=1.01,
         )
 
         for col, (_, row) in enumerate(examples):
             q_len = row["metadata"]["question_len"]
-            total_len = row["metadata"]["total_len"]
-            question = row["metadata"]["question"][:70]
-            model_ans = row["metadata"]["model_answer"][:60]
-
             axes[0, col].set_title(
-                f"Ex {col+1}\nQ: {question}...\nA: {model_ans}...", fontsize=7, pad=6
+                f"Q: {row['metadata']['question'][:60]}...\n"
+                f"A: {row['metadata']['model_answer'][:50]}...",
+                fontsize=7,
+                pad=5,
             )
-
-            for row_idx, layer in enumerate(layers):
-                ax = axes[row_idx, col]
+            for r, layer in enumerate(late_layers):
+                ax = axes[r, col]
                 pattern = row["layers"][layer]["pattern"]
-                attn = (
-                    pattern[0, head_idx, q_len:, :].float().numpy()
-                )  # [answer_len, src_len]
+                # guard: head_idx must exist in this model
+                n_heads = pattern.shape[1]
+                h = min(head_idx, n_heads - 1)
+                attn = pattern[0, h, q_len:, :].float().numpy()  # [ans, src]
 
-                # Mask the attention sink at position 0 before plotting
-                attn_masked = attn.copy()
-                attn_masked[:, 0] = 0  # zero out sink position
+                attn_plot = attn.copy()
+                attn_plot[:, 0] = 0  # suppress attention sink
+                vmax = attn_plot.max() if attn_plot.max() > 0 else 1.0
 
-                vmax = attn_masked.max() if attn_masked.max() > 0 else 1.0
-                ax.imshow(attn_masked, aspect="auto", cmap="hot", vmin=0, vmax=vmax)
-                ax.axvline(x=q_len - 0.5, color="white", linewidth=2.0, linestyle="-")
+                ax.imshow(attn_plot, aspect="auto", cmap="hot", vmin=0, vmax=vmax)
+                ax.axvline(x=q_len - 0.5, color="white", linewidth=1.5)
 
-                attn_to_question = attn[:, 1:q_len].sum() / (attn[:, 1:].sum() + 1e-9)
-                ax.set_title(f"←Q: {attn_to_question:.2f}", fontsize=5, pad=1, color="cyan")
+                q_frac = attn[:, 1:q_len].sum() / (attn[:, 1:].sum() + 1e-9)
+                ax.set_title(f"←Q: {q_frac:.2f}", fontsize=5, pad=1, color="cyan")
                 ax.set_yticks([])
                 ax.set_xticks([])
-
                 if col == 0:
                     ax.set_ylabel(f"L{layer}", fontsize=8, rotation=0, labelpad=28)
 
-                # Label Q|A boundary only on bottom row
-                if row_idx == n_layers - 1:
-                    ax.text(q_len, attn.shape[0] * 0.05, "Q|A", color="white",
-                            fontsize=6, ha="center", va="bottom")
-
-        # x-axis tick labels only on bottom row
-        for col, (_, row) in enumerate(examples):
-            total_len = row["metadata"]["total_len"]
-            q_len = row["metadata"]["question_len"]
-            ticks = list(range(0, total_len, max(1, total_len // 10)))
-            axes[-1, col].set_xticks(ticks)
-            axes[-1, col].set_xticklabels(
-                [f"{i}" + ("|A" if i == q_len else "") for i in ticks],
-                fontsize=6,
-                rotation=45,
-            )
-            axes[-1, col].set_xlabel("Source Position", fontsize=7)
-
         plt.tight_layout()
-        fname = f"{MODEL}_head{head_idx}_attn_{label.lower()}.png"
-        plt.savefig(fname, dpi=150, bbox_inches="tight")
-        
-        print(f"Saved → {fname}")
+        safe = model.replace("/", "_")
+        fname = os.path.join(
+            outdir, f"{safe}_head{head_idx}_attn_{pop_label.lower()}.png"
+        )
+        fig.savefig(fname, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  Saved → {fname}")
 
     plot_population(truth_df, "Truth")
     plot_population(halluc_df, "Hallucinated")
 
 
+# ── Main ───────────────────────────────────────────────────────────────────────
+
+
 def main():
-    df = load_data()
-    print("Data loaded successfully. Here's a preview:")
-    print(df.head())
-    
-    # Run the experiments
-    key_value_norm_trajectory(df)
-    attention_entropy(df)
-    value_cancellation_ratio(df)
-    per_head_consistency(df)
-    question_answer_token_analysis(df)
-    head7_attention_visualization(df)
+    args = parse_args()
+    os.makedirs(args.outdir, exist_ok=True)
+
+    df, label_key = load_data(args.file, args.label_key)
+
+    key_value_norm_trajectory(df, label_key, args.outdir, args.model)
+    attention_entropy(df, label_key, args.outdir, args.model)
+    value_cancellation_ratio(df, label_key, args.outdir, args.model)
+    consistency = per_head_consistency(df, label_key, args.outdir, args.model)
+    question_answer_token_analysis(df, label_key, args.outdir, args.model)
+
+    # Automatically pick the most discriminative head from Exp 7 results
+    best_head = best_discriminative_head(consistency)
+    print(f"\nMost discriminative head (from Exp 7): {best_head}")
+    head_attention_visualization(df, label_key, best_head, args.outdir, args.model)
+
+    print("\nAll experiments complete.")
 
 
-main()
+if __name__ == "__main__":
+    main()
