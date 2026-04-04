@@ -3,8 +3,8 @@ import torch
 import matplotlib.pyplot as plt
 import numpy as np
 
-FILE_PATH = "/Users/rachitdas/Desktop/hallucinations_arc/KV_cache_analysis/Qwen_Qwen3-1.7B_hallucination_labels_KV.pt"
-MODEL = "Qwen3-1.7B"  # for context in plots, if needed
+FILE_PATH = "/Users/rachitdas/Desktop/hallucinations_arc/KV_cache_analysis/meta-llama_Llama-3.1-8B-Instruct_hallucination_labels_KV.pt"
+MODEL = "llama-3.1-8b-instruct"  # for context in plots, if needed
 
 def load_data():
     print(f"Loading data from {FILE_PATH}...")
