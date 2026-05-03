@@ -106,54 +106,6 @@ def plot_embeddings_before_and_after_positional_embeddings(args, df):
         hallucinations_resid_pre,
     )
 
-
-def plot_norm_distributions(args, df):
-    """
-    For each of hook_embed and hook_pos_embed, plot the distribution
-    of mean L2 norms over answer tokens for truth vs hallucination.
-    This directly tests the zero attractor hypothesis without PCA artifacts.
-    """
-    hook_names = ["hook_embed", "hook_pos_embed"]
-
-    fig, axes = plt.subplots(1, len(hook_names), figsize=(7 * len(hook_names), 5))
-
-    for i, hook in enumerate(hook_names):
-        truth_norms, halluc_norms = [], []
-
-        for _, row in df.iterrows():
-            q_len = row["metadata"]["question_len"]
-            label = row["metadata"]["hallucination_label"]
-
-            s = row[hook]
-            arr = s.numpy() if isinstance(s, torch.Tensor) else s
-            if arr.ndim == 3:
-                arr = arr[0]  # [seq_len, d_model]
-
-            answer_states = arr[q_len:]  # [answer_len, d_model]
-            mean_norm = np.linalg.norm(answer_states, axis=-1).mean()
-
-            if label == 0:
-                truth_norms.append(mean_norm)
-            else:
-                halluc_norms.append(mean_norm)
-
-        axes[i].hist(truth_norms, bins=30, alpha=0.6, color="blue", label="Truth")
-        axes[i].hist(
-            halluc_norms, bins=30, alpha=0.6, color="red", label="Hallucination"
-        )
-        axes[i].set_title(f"Norm Distribution: {hook}")
-        axes[i].set_xlabel("Mean L2 Norm")
-        axes[i].set_ylabel("Count")
-        axes[i].legend()
-        axes[i].grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig(
-        os.path.join(args.outdir, f"{args.model}_norm_distributions.png"), dpi=150
-    )
-    plt.close()
-    print(f"Saved norm distributions plot.")
-
 def main():
     args = parse_args()
     os.makedirs(args.outdir, exist_ok=True)
@@ -161,7 +113,6 @@ def main():
     df, label_key = load_data(args.file, args.label_key)
 
     plot_embeddings_before_and_after_positional_embeddings(args, df)
-    plot_norm_distributions(args, df)
 
 
 if __name__ == "__main__":

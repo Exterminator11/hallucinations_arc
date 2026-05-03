@@ -106,7 +106,7 @@ def analyzeLayers():
     )
     plt.tight_layout()
 
-    plot_path = f"{re.sub('/', ' ', MODEL_NAME)}_hallucination_states_layer_analysis_500_mean.png"
+    plot_path = f"{re.sub('/', ' ', MODEL_NAME)}_hallucination_states_layer_analysis_500.png"
     plt.savefig(plot_path, dpi=150, bbox_inches="tight")
     print(f"Saved plot to {plot_path}")
 
