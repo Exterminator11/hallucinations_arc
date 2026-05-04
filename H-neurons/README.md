@@ -12,7 +12,7 @@ This experiment consists of two parts: ablating H-neurons to extract zeroed resp
 
 ### Part 1 — H-Neuron Ablation & State Extraction
 
-Run `H_neurons_extractor.py` to identify H-neurons, zero them out, and save the resulting response states.
+Run `H_neurons_extractor_ablator.ipynb` to identify H-neurons, zero them out, and save the resulting response states.
 
 **Outputs:**
 - `MODEL_NAME_1iter_zeroed_response_states.pkl` — ablated response states
@@ -22,10 +22,10 @@ Run `H_neurons_extractor.py` to identify H-neurons, zero them out, and save the 
 
 ### Part 2 — Probe Training on Ablated States
 
-Pass the `.pkl` file from Part 1 into `H_neurons_probes.py` to train linear probes on the ablated states. This follows the same probing methodology used in the Probes experiment.
+Pass the `.pkl` file from Part 1 into `probes_H_neurons.ipynb` to train linear probes on the ablated states. This follows the same probing methodology used in the Probes experiment.
 
 **Input:** `MODEL_NAME_1iter_zeroed_response_states.pkl`  
-**Output:** Probe training results *(consistent with the Probes experiment outputs)*
+**Output:** Probe training results 
 
 ---
 
@@ -33,5 +33,5 @@ Pass the `.pkl` file from Part 1 into `H_neurons_probes.py` to train linear prob
 
 | Script | Role | Output |
 |---|---|---|
-| `H_neurons_extractor.py` | Ablates H-neurons and extracts zeroed states | `MODEL_NAME_1iter_zeroed_response_states.pkl`, `MODEL_NAME_1iter_post_ablation.png` |
-| `H_neurons_probes.py` | Trains probes on ablated states | Probe results |
+| `H_neurons_extractor_ablator.ipynb` | Ablates H-neurons and extracts zeroed states | `MODEL_NAME_1iter_zeroed_response_states.pkl`, `MODEL_NAME_1iter_post_ablation.png` |
+| `probes_H_neurons.ipynb` | Trains probes on ablated states | Probe results |
