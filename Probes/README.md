@@ -2,7 +2,7 @@
 
 ## Overview
 
-This experiment trains linear probes on hidden states from the Geometric Characterization pipeline. All code is self-contained within a single notebook.
+This experiment trains probes on hidden states from the Geometric Characterization pipeline. All code is self-contained within a single notebook.
 
 > **Note:** Update `MODEL_NAME` and the input file path inside `Probes.ipynb` before running.
 

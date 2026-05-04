@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document describes the experimental components of the **Universal Lies** project, a research effort within the Hallucinations Arc. It outlines which experiments are part of the core study and which are supplementary.
+This document describes the experimental components of the **Universal Lies** project. It outlines which experiments are part of the core study and which are supplementary.
 
 ---
 
