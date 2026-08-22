@@ -4,6 +4,8 @@
 
 This repository contains the experiments for the **Universal Lies** project. Together, they study hallucinations in language models at the representation, attention, and neuron levels, and evaluate how well hallucinated and truthful responses can be separated.
 
+**Paper:** [`Universal Lies`](Universal_lies.pdf)
+
 ## Experiments
 
 ### 1. Geometric Characterization
